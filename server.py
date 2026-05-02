@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import mimetypes
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
@@ -23,26 +25,82 @@ OUTPUT_DIR = Path(os.environ.get("GAME_ASSETS_DIR", "~/game-assets")).expanduser
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 SYSTEM_PROMPT = """\
-You are a character concept artist for a Metroidvania game with a rag doll aesthetic. Every character you generate must follow these rules:
+You are a 2D game sprite generator.
 
-Construction — all characters are rag dolls:
+When a reference image is provided:
+- Reproduce the character in the reference image exactly as shown. The reference image is the sole source of truth for character design, style, colors, proportions, and details.
+- Do NOT describe or interpret the character in text — let the image speak for itself.
+- Apply ONLY the changes explicitly stated in the user prompt. Change nothing else.
+- Do NOT produce character turnaround sheets, multi-view layouts, or model sheets unless explicitly asked.
+- Do NOT add text, labels, annotations, borders, or reference grids.
+- One character, one pose, one view — unless the prompt says otherwise.
 
-Characters are soft dolls — their bodies have a fabric/stuffed quality, with visible stitching at seams and joints
-All characters have button eyes — circular and flat, style can vary (plain, stitched, cracked, etc.) but always button-like
-Hands are mitten-style — rounded, no individual fingers
-Hair is rendered as a solid mass with basic shape variation — no individual strand detail, no fine texture
-Color and shading:
-
-Each character uses a maximum of 5–6 flat colors total
-No gradients, blending, or soft shading — depth is suggested only through simple crease/fold lines in a slightly darker shade of the same flat color
-Bold, consistent black outlines around all shapes
-Output format:
-
-Character turnaround sheet: front, side, and back views on a white background
-When given a character description, design a unique character that fits it while keeping the above rules. Vary body proportions, outfit style, color palette, and personality freely — the rules above are the only constraints.
+When no reference image is provided:
+- Follow the user prompt exactly to generate the requested asset.
 """
 
 mcp = FastMCP("game-asset-server")
+
+
+def _postprocess_image(image_bytes: bytes) -> bytes:
+    """Remove the white background and crop to content with transparent padding.
+
+    Steps:
+    1. Convert to RGBA.
+    2. Flood-fill from all four corners, replacing white/near-white pixels
+       (tolerance 30) with transparency.
+    3. Crop to the tight bounding box of non-transparent content.
+    4. Add 8 % transparent padding on each side.
+    """
+    TOLERANCE = 30
+    PADDING_RATIO = 0.08
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    width, height = img.size
+    pixels = img.load()
+
+    def is_near_white(r: int, g: int, b: int) -> bool:
+        return r >= 255 - TOLERANCE and g >= 255 - TOLERANCE and b >= 255 - TOLERANCE
+
+    # BFS flood-fill from each corner
+    visited = [[False] * height for _ in range(width)]
+    queue: list[tuple[int, int]] = []
+    for cx, cy in [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)]:
+        r, g, b, a = pixels[cx, cy]
+        if is_near_white(r, g, b):
+            queue.append((cx, cy))
+            visited[cx][cy] = True
+
+    while queue:
+        x, y = queue.pop()
+        r, g, b, a = pixels[x, y]
+        if not is_near_white(r, g, b):
+            continue
+        pixels[x, y] = (r, g, b, 0)
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height and not visited[nx][ny]:
+                visited[nx][ny] = True
+                nr, ng, nb, na = pixels[nx, ny]
+                if is_near_white(nr, ng, nb):
+                    queue.append((nx, ny))
+
+    bbox = img.getbbox()
+    if bbox is None:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    img = img.crop(bbox)
+    cw, ch = img.size
+
+    pad_w = int(cw * PADDING_RATIO)
+    pad_h = int(ch * PADDING_RATIO)
+    padded = Image.new("RGBA", (cw + 2 * pad_w, ch + 2 * pad_h), (0, 0, 0, 0))
+    padded.paste(img, (pad_w, pad_h), img)
+
+    buf = io.BytesIO()
+    padded.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _validate_reference_image(path_str: str) -> Path:
@@ -145,12 +203,16 @@ async def generate_2d_asset(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_path = OUTPUT_DIR / f"asset_{timestamp}.png"
+
+    # Save raw bytes first, then post-process in-place
     output_path.write_bytes(image_bytes)
+    processed_bytes = _postprocess_image(image_bytes)
+    output_path.write_bytes(processed_bytes)
 
     return [
         ImageContent(
             type="image",
-            data=base64.b64encode(image_bytes).decode(),
+            data=base64.b64encode(processed_bytes).decode(),
             mimeType="image/png",
         ),
         TextContent(
