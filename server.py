@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
+
+logger = logging.getLogger(__name__)
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "google/gemini-3.1-flash-image-preview"
@@ -135,10 +137,8 @@ async def generate_2d_asset(
 
         data = response.json()
 
-        # DEBUG: log the full response structure so we can see what Gemini returns
-        print("[DEBUG] Full OpenRouter response:", json.dumps(data, indent=2), file=sys.stderr)
-        model_returned = data.get("model", "<not present>")
-        print(f"[DEBUG] Model returned by API: {model_returned}", file=sys.stderr)
+        logger.debug("Full OpenRouter response: %s", json.dumps(data, indent=2))
+        logger.debug("Model returned by API: %s", data.get("model", "<not present>"))
 
         image_bytes = await _extract_image_bytes(data, client)
 
@@ -175,13 +175,15 @@ async def _extract_image_bytes(data: dict, client: httpx.AsyncClient) -> bytes:
     message = choices[0].get("message", {})
     content = message.get("content")
 
-    # DEBUG: log content type and value so we can see exactly what Gemini returns
-    print(f"[DEBUG] choices[0].message.content type: {type(content).__name__}", file=sys.stderr)
-    print(f"[DEBUG] choices[0].message.content: {json.dumps(content, indent=2) if not isinstance(content, bytes) else repr(content)}", file=sys.stderr)
+    logger.debug("choices[0].message.content type: %s", type(content).__name__)
+    logger.debug(
+        "choices[0].message.content: %s",
+        json.dumps(content, indent=2) if not isinstance(content, bytes) else repr(content),
+    )
 
     # OpenRouter non-standard field: image data lives in message.images, not content
     images_field = message.get("images", [])
-    print(f"[DEBUG] choices[0].message.images: {json.dumps(images_field, indent=2)}", file=sys.stderr)
+    logger.debug("choices[0].message.images: %s", json.dumps(images_field, indent=2))
     if images_field:
         for img in images_field:
             img_url_val = img.get("image_url", {})
@@ -255,6 +257,9 @@ async def _fetch_or_decode(url: str, client: httpx.AsyncClient) -> bytes:
 
 
 def main() -> None:
+    log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise ValueError(
             "OPENROUTER_API_KEY environment variable is not set. "
