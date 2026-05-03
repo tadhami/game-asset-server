@@ -5,6 +5,8 @@
 *.env
 secrets.py
 config.local.*
+config.json
+!config.example.json
 
 # Python
 __pycache__/
