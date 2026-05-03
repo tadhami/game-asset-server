@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import logging
 import mimetypes
 import os
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +18,9 @@ import httpx
 from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
+
+import contact_sheet
+import sprite_processor
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +322,265 @@ async def _fetch_or_decode(url: str, client: httpx.AsyncClient) -> bytes:
     resp = await client.get(url)
     resp.raise_for_status()
     return resp.content
+
+
+_DEFAULT_CONFIG = {
+    "godot_executable": "/Applications/Godot.app/Contents/MacOS/Godot",
+    "game_project_path": "",
+    "removebg_api_key": "",
+    "defaults": {
+        "canvas_width": 100,
+        "canvas_height": 250,
+        "char_width": 90,
+        "foot_anchor_y": 238,
+        "animation_fps": 8,
+    },
+    "characters": {},
+}
+
+
+def _load_config() -> dict:
+    """Load config.json. Discovery: $GAME_ASSET_SERVER_CONFIG → ./config.json → defaults."""
+    candidates: list[Path] = []
+    env_path = os.environ.get("GAME_ASSET_SERVER_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    candidates.append(Path.cwd() / "config.json")
+
+    for path in candidates:
+        if path.is_file():
+            try:
+                return json.loads(path.read_text())
+            except Exception as exc:
+                logger.warning("Failed to read config at %s: %s", path, exc)
+    return dict(_DEFAULT_CONFIG)
+
+
+def _resolve_dimensions(
+    config: dict,
+    character: str,
+    overrides: dict,
+) -> dict:
+    """Three-layer precedence: tool-call overrides > character config > defaults."""
+    defaults = {**_DEFAULT_CONFIG["defaults"], **config.get("defaults", {})}
+    char_cfg = config.get("characters", {}).get(character, {}) or {}
+    eff = dict(defaults)
+    for k, v in char_cfg.items():
+        if v is not None:
+            eff[k] = v
+    for k, v in overrides.items():
+        if v is not None:
+            eff[k] = v
+    return eff
+
+
+async def _generate_one_image(prompt: str, client: httpx.AsyncClient) -> bytes:
+    """Generate a single 2D asset image (no reference) and return raw PNG bytes."""
+    api_key = os.environ["OPENROUTER_API_KEY"]
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "modalities": ["image", "text"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "max_tokens": 8192,
+        "image_config": {"aspect_ratio": "1:1"},
+    }
+    response = await client.post(OPENROUTER_API_URL, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"OpenRouter API returned {response.status_code}: {response.text[:500]}"
+        )
+    return await _extract_image_bytes(response.json(), client)
+
+
+def _stitch_gif(frame_paths: list[str], output_path: str, fps: int) -> str:
+    """Combine frames into a looping animated GIF using Pillow."""
+    images = [Image.open(p).convert("RGBA") for p in frame_paths]
+    duration_ms = max(1, int(round(1000 / fps)))
+    images[0].save(
+        output_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration_ms,
+        loop=0,
+        disposal=2,
+    )
+    return output_path
+
+
+def _try_godot_preview(
+    processed_frames: list[str],
+    output_gif_path: Path,
+    config: dict,
+    fps: int,
+) -> str | None:
+    """Run Godot headless to render a preview, then stitch its frames into a GIF.
+
+    Returns the GIF path on success, None if Godot or the preview scene is
+    unavailable (logs a warning in that case — never raises).
+    """
+    sidecar_path = Path("/tmp/sprite_preview_config.json")
+    sidecar_path.write_text(json.dumps({
+        "frames": processed_frames,
+        "fps": fps,
+        "loop": True,
+        "duration_seconds": 3,
+    }))
+
+    godot_exec = config.get("godot_executable", "")
+    game_path = config.get("game_project_path", "")
+    if not godot_exec or not Path(godot_exec).exists():
+        logger.warning("Godot executable not found at %s — skipping GIF preview", godot_exec)
+        return None
+    if not game_path:
+        logger.warning("game_project_path not set in config — skipping GIF preview")
+        return None
+
+    scene_path = Path(game_path) / "tests/integration/sprite_preview.tscn"
+    if not scene_path.exists():
+        logger.warning(
+            "sprite_preview.tscn not found at %s — skipping GIF preview", scene_path
+        )
+        return None
+
+    render_dir = Path("/tmp") / f"sprite_preview_render_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    movie_target = render_dir / "frame.png"
+
+    cmd = [
+        godot_exec,
+        "--headless",
+        "--path", game_path,
+        "--write-movie", str(movie_target),
+        "--fixed-fps", str(fps),
+        "res://tests/integration/sprite_preview.tscn",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        logger.warning("Godot preview run failed (%s) — skipping GIF", exc)
+        return None
+
+    if result.returncode != 0:
+        logger.warning(
+            "Godot exited %s — skipping GIF. stderr: %s",
+            result.returncode, result.stderr[:500],
+        )
+        return None
+
+    rendered = sorted(render_dir.glob("*.png"))
+    if not rendered:
+        logger.warning("Godot produced no frames in %s — skipping GIF", render_dir)
+        return None
+
+    return _stitch_gif([str(p) for p in rendered], str(output_gif_path), fps)
+
+
+@mcp.tool()
+async def generate_game_sprite(
+    prompt: str,
+    animation: str = "idle",
+    character: str = "player",
+    frame_count: int = 6,
+    preview: bool = True,
+    write_to_assets: bool = False,
+    canvas_width: int | None = None,
+    canvas_height: int | None = None,
+    char_width: int | None = None,
+    foot_anchor_y: int | None = None,
+) -> dict:
+    """Generate an animation strip of game-ready sprite frames.
+
+    For each of `frame_count` frames, runs the same generation pipeline as
+    `generate_2d_asset`, then post-processes via `sprite_processor.process_image`
+    (background removal + canvas placement at the configured anchor). Builds
+    a horizontal contact sheet from all processed frames.
+
+    If `preview=True`, optionally runs Godot headless to render a GIF preview
+    using `tests/integration/sprite_preview.tscn` in the game project. Skips
+    GIF generation gracefully (with a warning) if Godot or the scene is
+    unavailable.
+
+    If `write_to_assets=True`, copies the processed frames to
+    `{game_project_path}/assets/characters/{character}/{animation}/frame_N.png`.
+
+    Dimension precedence (highest first): tool-call args, character config,
+    defaults from config.json.
+    """
+    config = _load_config()
+    overrides = {
+        "canvas_width": canvas_width,
+        "canvas_height": canvas_height,
+        "char_width": char_width,
+        "foot_anchor_y": foot_anchor_y,
+    }
+    eff = _resolve_dimensions(config, character, overrides)
+    fps = int(eff.get("animation_fps", 8))
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    work_dir = OUTPUT_DIR / "sprites" / character / f"{animation}_{timestamp}"
+    raw_dir = work_dir / "raw"
+    processed_dir = work_dir / "processed"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    processed_paths: list[str] = []
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for i in range(frame_count):
+            image_bytes = await _generate_one_image(prompt, client)
+            raw_path = raw_dir / f"frame_{i}.png"
+            raw_path.write_bytes(image_bytes)
+
+            processed_path = processed_dir / f"frame_{i}.png"
+            await asyncio.to_thread(
+                sprite_processor.process_image,
+                str(raw_path),
+                str(processed_path),
+                int(eff["canvas_width"]),
+                int(eff["canvas_height"]),
+                int(eff["char_width"]),
+                int(eff["foot_anchor_y"]),
+                config.get("removebg_api_key", "") or "",
+            )
+            processed_paths.append(str(processed_path))
+
+    contact_sheet_path = work_dir / "contact_sheet.png"
+    contact_sheet.make_contact_sheet(processed_paths, str(contact_sheet_path))
+
+    gif_path: str | None = None
+    if preview:
+        gif_target = work_dir / "preview.gif"
+        gif_path = await asyncio.to_thread(
+            _try_godot_preview, processed_paths, gif_target, config, fps
+        )
+
+    written = False
+    if write_to_assets:
+        game_path = config.get("game_project_path", "")
+        if not game_path:
+            logger.warning("write_to_assets=True but game_project_path is empty")
+        else:
+            assets_dir = Path(game_path) / "assets" / "characters" / character / animation
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            for i, src in enumerate(processed_paths):
+                shutil.copy2(src, assets_dir / f"frame_{i}.png")
+            written = True
+
+    return {
+        "frames": processed_paths,
+        "contact_sheet": str(contact_sheet_path),
+        "gif": gif_path,
+        "written_to_assets": written,
+        "effective_config": eff,
+    }
 
 
 def main() -> None:

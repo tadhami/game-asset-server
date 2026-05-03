@@ -17,4 +17,4 @@ dependencies = [
 game-asset-server = "server:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["server.py"]
+only-include = ["server.py", "sprite_processor.py", "contact_sheet.py"]
