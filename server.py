@@ -374,8 +374,30 @@ def _resolve_dimensions(
     return eff
 
 
-async def _generate_one_image(prompt: str, client: httpx.AsyncClient) -> bytes:
-    """Generate a single 2D asset image (no reference) and return raw PNG bytes."""
+async def _generate_one_image(
+    prompt: str,
+    client: httpx.AsyncClient,
+    reference_image_path: str | Path | None = None,
+) -> bytes:
+    """Generate a single 2D asset image and return raw PNG bytes.
+
+    If `reference_image_path` is provided, the image is base64-encoded and
+    sent as a multimodal `image_url` part alongside the text prompt.
+    """
+    if reference_image_path:
+        ref_path = _validate_reference_image(str(reference_image_path))
+        ref_b64 = base64.b64encode(ref_path.read_bytes()).decode()
+        mime = mimetypes.guess_type(str(ref_path))[0] or "image/png"
+        user_content: object = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{ref_b64}"},
+            },
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        user_content = prompt
+
     api_key = os.environ["OPENROUTER_API_KEY"]
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -386,12 +408,11 @@ async def _generate_one_image(prompt: str, client: httpx.AsyncClient) -> bytes:
         "modalities": ["image", "text"],
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 1.0,
         "top_p": 0.95,
         "max_tokens": 8192,
-        "image_config": {"aspect_ratio": "1:1"},
     }
     response = await client.post(OPENROUTER_API_URL, headers=headers, json=payload)
     if response.status_code != 200:
@@ -399,6 +420,51 @@ async def _generate_one_image(prompt: str, client: httpx.AsyncClient) -> bytes:
             f"OpenRouter API returned {response.status_code}: {response.text[:500]}"
         )
     return await _extract_image_bytes(response.json(), client)
+
+
+def _build_sheet_prompt(animation: str, frame_count: int, frame_size: int) -> str:
+    """Build a sprite-sheet generation prompt.
+
+    `animation` is the caller-supplied animation-specific frame breakdown
+    (e.g., per-frame pose descriptions for a run cycle). It is embedded
+    verbatim in the middle of the prompt.
+    """
+    sheet_width = frame_size * frame_count
+    sheet_height = frame_size
+    return (
+        f"Using the provided reference image as the base character, generate a sprite "
+        f"sheet of exactly {frame_count} frames arranged horizontally left-to-right on "
+        f"a single canvas of {sheet_width}x{sheet_height} pixels (each frame is exactly "
+        f"{frame_size}x{frame_size} pixels, evenly spaced with no gaps, no borders, no "
+        f"labels).\n\n"
+        f"Reproduce the character from the reference image exactly as-is. Do not alter "
+        f"any aspect of the character's design, colors, outline, shading, proportions, "
+        f"or style. The reference image is the ground truth — treat it as a "
+        f"pixel-perfect template.\n\n"
+        f"{animation}\n\n"
+        f"Critical consistency rules: The head, face, colors, outline weight, and "
+        f"shading must be identical across all {frame_count} frames. Only the pose "
+        f"elements described per-frame above may differ.\n\n"
+        f"Output only the sprite sheet image. Transparent background. No frame numbers. "
+        f"No labels. No borders between frames."
+    )
+
+
+def _slice_sheet(sheet_path: str, frame_count: int, output_dir: str) -> list[str]:
+    """Slice a horizontal sprite sheet into `frame_count` equal-width frames.
+
+    Each frame's width is `sheet_width // frame_count`. Frames are saved as
+    `raw_frame_N.png` in `output_dir` and the list of paths is returned.
+    """
+    img = Image.open(sheet_path)
+    frame_w = img.width // frame_count
+    paths: list[str] = []
+    for i in range(frame_count):
+        frame = img.crop((i * frame_w, 0, (i + 1) * frame_w, img.height))
+        out = os.path.join(output_dir, f"raw_frame_{i}.png")
+        frame.save(out)
+        paths.append(out)
+    return paths
 
 
 def _stitch_gif(frame_paths: list[str], output_path: str, fps: int) -> str:
@@ -457,7 +523,6 @@ def _try_godot_preview(
 
     cmd = [
         godot_exec,
-        "--headless",
         "--path", game_path,
         "--write-movie", str(movie_target),
         "--fixed-fps", str(fps),
@@ -489,9 +554,11 @@ async def generate_game_sprite(
     prompt: str,
     animation: str = "idle",
     character: str = "player",
-    frame_count: int = 6,
+    frame_count: int = 8,
+    frame_size: int = 128,
     preview: bool = True,
     write_to_assets: bool = False,
+    reference_image: str | None = None,
     canvas_width: int | None = None,
     canvas_height: int | None = None,
     char_width: int | None = None,
@@ -499,14 +566,22 @@ async def generate_game_sprite(
 ) -> dict:
     """Generate an animation strip of game-ready sprite frames.
 
-    For each of `frame_count` frames, runs the same generation pipeline as
-    `generate_2d_asset`, then post-processes via `sprite_processor.process_image`
-    (background removal + canvas placement at the configured anchor). Builds
-    a horizontal contact sheet from all processed frames.
+    `prompt` is the animation-specific frame breakdown (e.g., per-frame pose
+    descriptions). It is embedded inside a sprite-sheet prompt that asks the
+    model to render all frames on a single horizontal canvas, using
+    `reference_image` as the visual ground truth for the character.
 
-    If `preview=True`, optionally runs Godot headless to render a GIF preview
-    using `tests/integration/sprite_preview.tscn` in the game project. Skips
-    GIF generation gracefully (with a warning) if Godot or the scene is
+    The returned sheet is sliced into `frame_count` equal-width raw frames,
+    each of which is post-processed via `sprite_processor.process_image`
+    (background removal + canvas placement at the configured anchor). A
+    horizontal contact sheet is built from the processed frames.
+
+    If `reference_image` is None, defaults to
+    `{game_project_path}/assets/characters/{character}/idle/frame_0.png`.
+
+    If `preview=True`, optionally runs Godot to render a GIF preview using
+    `tests/integration/sprite_preview.tscn` in the game project. Skips GIF
+    generation gracefully (with a warning) if Godot or the scene is
     unavailable.
 
     If `write_to_assets=True`, copies the processed frames to
@@ -525,6 +600,17 @@ async def generate_game_sprite(
     eff = _resolve_dimensions(config, character, overrides)
     fps = int(eff.get("animation_fps", 8))
 
+    if reference_image is None:
+        game_path = config.get("game_project_path", "")
+        if not game_path:
+            raise ValueError(
+                "reference_image not provided and game_project_path is empty in "
+                "config — cannot resolve default reference image."
+            )
+        reference_image = str(
+            Path(game_path) / "assets" / "characters" / character / "idle" / "frame_0.png"
+        )
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     work_dir = OUTPUT_DIR / "sprites" / character / f"{animation}_{timestamp}"
     raw_dir = work_dir / "raw"
@@ -532,25 +618,34 @@ async def generate_game_sprite(
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    processed_paths: list[str] = []
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        for i in range(frame_count):
-            image_bytes = await _generate_one_image(prompt, client)
-            raw_path = raw_dir / f"frame_{i}.png"
-            raw_path.write_bytes(image_bytes)
+    sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size)
 
-            processed_path = processed_dir / f"frame_{i}.png"
-            await asyncio.to_thread(
-                sprite_processor.process_image,
-                str(raw_path),
-                str(processed_path),
-                int(eff["canvas_width"]),
-                int(eff["canvas_height"]),
-                int(eff["char_width"]),
-                int(eff["foot_anchor_y"]),
-                config.get("removebg_api_key", "") or "",
-            )
-            processed_paths.append(str(processed_path))
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        sheet_bytes = await _generate_one_image(
+            sheet_prompt, client, reference_image_path=reference_image
+        )
+
+    sheet_path = work_dir / "sheet.png"
+    sheet_path.write_bytes(sheet_bytes)
+
+    raw_paths = await asyncio.to_thread(
+        _slice_sheet, str(sheet_path), frame_count, str(raw_dir)
+    )
+
+    processed_paths: list[str] = []
+    for i, raw_path in enumerate(raw_paths):
+        processed_path = processed_dir / f"frame_{i}.png"
+        await asyncio.to_thread(
+            sprite_processor.process_image,
+            raw_path,
+            str(processed_path),
+            int(eff["canvas_width"]),
+            int(eff["canvas_height"]),
+            int(eff["char_width"]),
+            int(eff["foot_anchor_y"]),
+            config.get("removebg_api_key", "") or "",
+        )
+        processed_paths.append(str(processed_path))
 
     contact_sheet_path = work_dir / "contact_sheet.png"
     contact_sheet.make_contact_sheet(processed_paths, str(contact_sheet_path))
@@ -576,9 +671,11 @@ async def generate_game_sprite(
 
     return {
         "frames": processed_paths,
+        "sheet": str(sheet_path),
         "contact_sheet": str(contact_sheet_path),
         "gif": gif_path,
         "written_to_assets": written,
+        "reference_image": reference_image,
         "effective_config": eff,
     }
 
