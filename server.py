@@ -485,17 +485,31 @@ def _slice_sheet(sheet_path: str, frame_count: int, output_dir: str) -> list[str
     return paths
 
 
+_GIF_BG_COLOR = (30, 30, 30, 255)  # dark background — shows sprite colors clearly
+
+
 def _stitch_gif(frame_paths: list[str], output_path: str, fps: int) -> str:
-    """Combine frames into a looping animated GIF using Pillow."""
-    images = [Image.open(p).convert("RGBA") for p in frame_paths]
+    """Combine frames into a looping animated GIF using Pillow.
+
+    GIF supports only 1-bit transparency, so raw RGBA frames produce
+    palette-colour artifacts for transparent regions. We composite each frame
+    onto a solid dark background first so the character is clean against a
+    consistent colour instead of a random palette entry.
+    """
+    composited: list[Image.Image] = []
+    for p in frame_paths:
+        frame = Image.open(p).convert("RGBA")
+        bg = Image.new("RGBA", frame.size, _GIF_BG_COLOR)
+        bg.paste(frame, mask=frame.split()[3])
+        composited.append(bg.convert("RGB"))
+
     duration_ms = max(1, int(round(1000 / fps)))
-    images[0].save(
+    composited[0].save(
         output_path,
         save_all=True,
-        append_images=images[1:],
+        append_images=composited[1:],
         duration=duration_ms,
         loop=0,
-        disposal=2,
     )
     return output_path
 
