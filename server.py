@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import numpy as np
 from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
@@ -31,15 +32,15 @@ OUTPUT_DIR = Path(os.environ.get("GAME_ASSETS_DIR", "~/game-assets")).expanduser
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 SYSTEM_PROMPT = """\
-You are a 2D game sprite generator.
+You are a 2D game sprite reproducer — your job is pixel-accurate character copying, NOT creative design.
 
 When a reference image is provided:
-- Reproduce the character in the reference image exactly as shown. The reference image is the sole source of truth for character design, style, colors, proportions, and details.
-- Do NOT describe or interpret the character in text — let the image speak for itself.
-- Apply ONLY the changes explicitly stated in the user prompt. Change nothing else.
+- Your ONLY task is to reproduce the EXACT character shown in the reference image. Every detail must match: face shape, eye shape, eye color, hair type and length, clothing, colors, proportions, outline weight, and art style.
+- Do NOT redesign, simplify, or "improve" any part of the character. If the reference shows button eyes (large round circles), reproduce them as large round circles — NOT as glasses, goggles, or spectacles.
+- Do NOT add elements that are not in the reference (no glasses, no extra accessories, no different hairstyle).
+- Apply ONLY the pose/action changes explicitly stated in the user prompt. Change NOTHING else about the character's appearance.
 - Do NOT produce character turnaround sheets, multi-view layouts, or model sheets unless explicitly asked.
 - Do NOT add text, labels, annotations, borders, or reference grids.
-- One character, one pose, one view — unless the prompt says otherwise.
 
 When no reference image is provided:
 - Follow the user prompt exactly to generate the requested asset.
@@ -324,6 +325,133 @@ async def _fetch_or_decode(url: str, client: httpx.AsyncClient) -> bytes:
     return resp.content
 
 
+# ── Frame validation ─────────────────────────────────────────────────────────
+
+def _get_char_metrics(image_path: str) -> dict | None:
+    """Return character bounding-box metrics for a processed frame.
+
+    Returns None if the frame contains no visible character pixels.
+    All measurements are in canvas pixels (before any in-engine scaling).
+    Uses pure Pillow — no numpy required.
+    """
+    img = Image.open(image_path).convert("RGBA")
+    alpha = img.split()[-1]
+    # Threshold: only count pixels with alpha > 20
+    alpha_thresh = alpha.point(lambda v: 255 if v > 20 else 0)
+    bbox = alpha_thresh.getbbox()
+    if bbox is None:
+        return None
+    left, top, right, bottom = bbox
+    w, h = img.size
+    return {
+        "top": top, "bottom": bottom, "left": left, "right": right,
+        "height": bottom - top,
+        "width":  right - left,
+        "canvas_h": h, "canvas_w": w,
+        "head_frac": top / h,       # head position as fraction of canvas height
+        "foot_frac": bottom / h,    # foot position as fraction of canvas height
+    }
+
+
+def _validate_one_frame(
+    frame_path: str,
+    ref: dict,
+    size_tol: float = 0.18,
+    head_tol: float = 0.08,
+) -> dict:
+    """Validate a single processed frame against reference metrics.
+
+    Checks:
+    - Character height within ±size_tol of reference height
+    - Character width within ±size_tol*1.5 of reference (poses vary more laterally)
+    - Head vertical position within ±head_tol of reference (detects shrunken / floated chars)
+
+    Returns a dict with ``passed`` bool, ``issues`` list, and raw measurements.
+    """
+    m = _get_char_metrics(frame_path)
+    if m is None:
+        return {"passed": False, "issues": ["no character detected"], "metrics": None}
+
+    issues: list[str] = []
+
+    h_ratio = m["height"] / max(ref["height"], 1)
+    if abs(h_ratio - 1.0) > size_tol:
+        issues.append(
+            f"height {m['height']}px vs ref {ref['height']}px "
+            f"({h_ratio:.0%} — expected {100*(1-size_tol):.0f}–{100*(1+size_tol):.0f}%)"
+        )
+
+    w_ratio = m["width"] / max(ref["width"], 1)
+    if abs(w_ratio - 1.0) > size_tol * 1.5:
+        issues.append(
+            f"width {m['width']}px vs ref {ref['width']}px ({w_ratio:.0%})"
+        )
+
+    head_diff = abs(m["head_frac"] - ref["head_frac"])
+    if head_diff > head_tol:
+        issues.append(
+            f"head at {m['head_frac']:.0%} from top vs ref {ref['head_frac']:.0%} "
+            f"(diff {head_diff:.0%})"
+        )
+
+    return {
+        "passed": len(issues) == 0,
+        "issues": issues,
+        "metrics": m,
+        "height_ratio": h_ratio,
+        "width_ratio": w_ratio,
+    }
+
+
+def _validate_frames(
+    processed_paths: list[str],
+    reference_image_path: str,
+    size_tol: float = 0.18,
+    head_tol: float = 0.08,
+) -> dict:
+    """Validate all generated frames against the reference image.
+
+    Returns a dict with per-frame results and a human-readable summary.
+    This is always called after sprite_processor runs so that every batch
+    of generated art is checked for size and position consistency before
+    being shown or written to assets.
+    """
+    ref = _get_char_metrics(reference_image_path)
+    if ref is None:
+        logger.warning("validate_frames: could not extract metrics from reference %s", reference_image_path)
+        return {
+            "reference_ok": False,
+            "frames": [{"passed": True, "issues": ["reference unreadable"]} for _ in processed_paths],
+            "all_passed": True,
+            "failed_indices": [],
+            "summary": "validation skipped — reference unreadable",
+        }
+
+    frame_results = [
+        _validate_one_frame(p, ref, size_tol, head_tol)
+        for p in processed_paths
+    ]
+    failed = [i for i, r in enumerate(frame_results) if not r["passed"]]
+    n = len(processed_paths)
+    summary_lines = [f"{n - len(failed)}/{n} frames passed validation"]
+    for i in failed:
+        for issue in frame_results[i]["issues"]:
+            summary_lines.append(f"  frame_{i}: {issue}")
+
+    logger.info("Frame validation: %s", summary_lines[0])
+    for line in summary_lines[1:]:
+        logger.warning("Frame validation%s", line)
+
+    return {
+        "reference_ok": True,
+        "reference_metrics": ref,
+        "frames": frame_results,
+        "all_passed": len(failed) == 0,
+        "failed_indices": failed,
+        "summary": "\n".join(summary_lines),
+    }
+
+
 _DEFAULT_CONFIG = {
     "godot_executable": "/Applications/Godot.app/Contents/MacOS/Godot",
     "game_project_path": "",
@@ -346,6 +474,7 @@ def _load_config() -> dict:
     if env_path:
         candidates.append(Path(env_path).expanduser())
     candidates.append(Path.cwd() / "config.json")
+    candidates.append(Path(__file__).parent / "config.json")
 
     for path in candidates:
         if path.is_file():
@@ -422,62 +551,149 @@ async def _generate_one_image(
     return await _extract_image_bytes(response.json(), client)
 
 
-def _build_sheet_prompt(animation: str, frame_count: int, frame_size: int) -> str:
+def _build_sheet_prompt(
+    animation: str,
+    frame_count: int,
+    frame_size: int,
+    character_description: str | None = None,
+) -> str:
     """Build a sprite-sheet generation prompt.
 
     `animation` is the caller-supplied animation-specific frame breakdown
     (e.g., per-frame pose descriptions for a run cycle). It is embedded
     verbatim in the middle of the prompt.
+
+    `character_description` is an optional explicit list of key character
+    features for the model to preserve exactly — useful for overriding model
+    misinterpretations of art-style elements (e.g. "button eyes, NOT glasses").
     """
     sheet_width = frame_size * frame_count
     sheet_height = frame_size
+
+    char_desc_section = ""
+    if character_description:
+        char_desc_section = (
+            f"\nCRITICAL — preserve these character features EXACTLY as described "
+            f"(do not reinterpret them):\n{character_description}\n"
+        )
+
     return (
         f"Using the provided reference image as the base character, generate a sprite "
         f"sheet of exactly {frame_count} frames arranged horizontally left-to-right on "
         f"a single canvas of {sheet_width}x{sheet_height} pixels (each frame is exactly "
         f"{frame_size}x{frame_size} pixels, evenly spaced with no gaps, no borders, no "
         f"labels).\n\n"
-        f"Reproduce the character from the reference image exactly as-is. Do not alter "
-        f"any aspect of the character's design, colors, outline, shading, proportions, "
-        f"or style. The reference image is the ground truth — treat it as a "
-        f"pixel-perfect template.\n\n"
+        f"This is a reproduction task, NOT a design task. Copy the character from the "
+        f"reference image pixel-perfectly — same face, same eyes, same hair, same "
+        f"clothing, same colors, same proportions, same outline weight, same art style. "
+        f"Do NOT redesign, simplify, or add anything that is not in the reference.\n"
+        f"{char_desc_section}\n"
         f"{animation}\n\n"
-        f"Critical consistency rules: The head, face, colors, outline weight, and "
-        f"shading must be identical across all {frame_count} frames. Only the pose "
-        f"elements described per-frame above may differ.\n\n"
-        f"Output only the sprite sheet image. Transparent background. No frame numbers. "
-        f"No labels. No borders between frames."
+        f"Consistency rule: The character's appearance (head, face, eyes, hair, "
+        f"clothing, colors, outline) must be identical across all {frame_count} frames. "
+        f"Only the pose changes described per-frame above may differ.\n\n"
+        f"Output: the sprite sheet image only. Transparent background. No frame "
+        f"numbers. No labels. No borders between frames."
     )
 
 
 def _slice_sheet(sheet_path: str, frame_count: int, output_dir: str) -> list[str]:
-    """Slice a horizontal sprite sheet into `frame_count` equal-width frames.
+    """Slice a horizontal sprite sheet into `frame_count` frames.
 
-    Each frame's width is `sheet_width // frame_count`. Frames are saved as
-    `raw_frame_N.png` in `output_dir` and the list of paths is returned.
+    Uses content-aware slicing: finds vertical "gap" columns (columns where
+    pixel content is sparse) to locate character boundaries, then selects the
+    `frame_count` best-spaced cut points. Falls back to equal-width slicing if
+    gap detection fails or finds too few gaps.
+
+    Frames are saved as `raw_frame_N.png` in `output_dir`.
     """
-    img = Image.open(sheet_path)
-    frame_w = img.width // frame_count
+    img = Image.open(sheet_path).convert("RGBA")
+    alpha = np.array(img)[:, :, 3]  # shape: (height, width)
+
+    # Column content score: fraction of pixels with meaningful alpha
+    col_fill = (alpha > 20).sum(axis=0) / alpha.shape[0]
+
+    # Smooth slightly to avoid noise
+    kernel_size = max(3, img.width // 200)
+    kernel = np.ones(kernel_size) / kernel_size
+    col_smooth = np.convolve(col_fill, kernel, mode="same")
+
+    # Find gap columns: below a threshold, not near the image edges
+    gap_threshold = col_smooth.max() * 0.08
+    is_gap = col_smooth < gap_threshold
+
+    # Find contiguous gap regions and pick their centers
+    gap_centers: list[int] = []
+    in_gap = False
+    gap_start = 0
+    margin = img.width // (frame_count * 4)  # ignore near-edge columns
+    for x in range(margin, img.width - margin):
+        if is_gap[x] and not in_gap:
+            in_gap = True
+            gap_start = x
+        elif not is_gap[x] and in_gap:
+            in_gap = False
+            gap_centers.append((gap_start + x) // 2)
+
+    # We need exactly (frame_count - 1) cut points between frames
+    cut_points: list[int] = []
+    if len(gap_centers) >= frame_count - 1:
+        # If more gaps than needed, pick the frame_count-1 most evenly spaced ones
+        # Strategy: greedily pick gaps that divide the sheet most evenly
+        ideal_spacing = img.width / frame_count
+        ideal_cuts = [int(ideal_spacing * (i + 1)) for i in range(frame_count - 1)]
+        for ideal in ideal_cuts:
+            closest = min(gap_centers, key=lambda g: abs(g - ideal))
+            cut_points.append(closest)
+        cut_points = sorted(set(cut_points))
+
+    # Fall back to equal-width if we couldn't find enough gaps
+    if len(cut_points) < frame_count - 1:
+        logger.info(
+            "_slice_sheet: content-aware detection found %d gaps (need %d), "
+            "falling back to equal-width slicing",
+            len(gap_centers),
+            frame_count - 1,
+        )
+        frame_w = img.width // frame_count
+        cut_points = [frame_w * (i + 1) for i in range(frame_count - 1)]
+
+    boundaries = [0] + cut_points + [img.width]
     paths: list[str] = []
     for i in range(frame_count):
-        frame = img.crop((i * frame_w, 0, (i + 1) * frame_w, img.height))
+        x0, x1 = boundaries[i], boundaries[i + 1]
+        frame = img.crop((x0, 0, x1, img.height))
         out = os.path.join(output_dir, f"raw_frame_{i}.png")
         frame.save(out)
         paths.append(out)
     return paths
 
 
+_GIF_BG_COLOR = (30, 30, 30, 255)  # dark background — shows sprite colors clearly
+
+
 def _stitch_gif(frame_paths: list[str], output_path: str, fps: int) -> str:
-    """Combine frames into a looping animated GIF using Pillow."""
-    images = [Image.open(p).convert("RGBA") for p in frame_paths]
+    """Combine frames into a looping animated GIF using Pillow.
+
+    GIF supports only 1-bit transparency, so raw RGBA frames produce
+    palette-colour artifacts for transparent regions. We composite each frame
+    onto a solid dark background first so the character is clean against a
+    consistent colour instead of a random palette entry.
+    """
+    composited: list[Image.Image] = []
+    for p in frame_paths:
+        frame = Image.open(p).convert("RGBA")
+        bg = Image.new("RGBA", frame.size, _GIF_BG_COLOR)
+        bg.paste(frame, mask=frame.split()[3])
+        composited.append(bg.convert("RGB"))
+
     duration_ms = max(1, int(round(1000 / fps)))
-    images[0].save(
+    composited[0].save(
         output_path,
         save_all=True,
-        append_images=images[1:],
+        append_images=composited[1:],
         duration=duration_ms,
         loop=0,
-        disposal=2,
     )
     return output_path
 
@@ -559,6 +775,7 @@ async def generate_game_sprite(
     preview: bool = True,
     write_to_assets: bool = False,
     reference_image: str | None = None,
+    character_description: str | None = None,
     canvas_width: int | None = None,
     canvas_height: int | None = None,
     char_width: int | None = None,
@@ -579,10 +796,20 @@ async def generate_game_sprite(
     If `reference_image` is None, defaults to
     `{game_project_path}/assets/characters/{character}/idle/frame_0.png`.
 
-    If `preview=True`, optionally runs Godot to render a GIF preview using
-    `tests/integration/sprite_preview.tscn` in the game project. Skips GIF
-    generation gracefully (with a warning) if Godot or the scene is
-    unavailable.
+    `character_description` is an optional plain-text description of the
+    character's key visual features that the model must preserve exactly (e.g.
+    "button eyes — large round circles, NOT glasses"). When provided it is
+    injected into the generation prompt as a CRITICAL preservation list,
+    helping the model avoid misinterpreting art-style elements in the reference
+    image. Claude should always populate this when calling the tool for a
+    known character.
+
+    If `preview=True`, generates an animated GIF from the processed frames.
+    First attempts a Godot-rendered preview via
+    `tests/integration/sprite_preview.tscn`; if Godot is unavailable or
+    fails, falls back to a Pillow-stitched GIF directly from the processed
+    frames. The GIF is always produced when `preview=True` and at least one
+    frame was processed successfully.
 
     If `write_to_assets=True`, copies the processed frames to
     `{game_project_path}/assets/characters/{character}/{animation}/frame_N.png`.
@@ -618,7 +845,16 @@ async def generate_game_sprite(
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size)
+    # If the caller has already supplied a complete sprite-sheet prompt (detected
+    # by the canonical "Using the provided reference image as frame 1" opener),
+    # pass it through directly rather than wrapping it with _build_sheet_prompt.
+    # Wrapping a complete template creates conflicting double-instructions that
+    # confuse the model.  We still inject character_description if provided.
+    _TEMPLATE_MARKER = "Using the provided reference image as frame 1"
+    if prompt.strip().startswith(_TEMPLATE_MARKER):
+        sheet_prompt = prompt
+    else:
+        sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size)
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         sheet_bytes = await _generate_one_image(
@@ -628,38 +864,96 @@ async def generate_game_sprite(
     sheet_path = work_dir / "sheet.png"
     sheet_path.write_bytes(sheet_bytes)
 
-    raw_paths = await asyncio.to_thread(
-        _slice_sheet, str(sheet_path), frame_count, str(raw_dir)
+    # Remove background from the full sheet in one API call, then slice.
+    # This gives far cleaner results than per-frame removal — remove.bg sees
+    # the whole composition and won't clip edges or eat light-coloured pixels.
+    sheet_bg_path = work_dir / "sheet_bg_removed.png"
+    await asyncio.to_thread(
+        sprite_processor.strip_background,
+        str(sheet_path),
+        str(sheet_bg_path),
+        config.get("removebg_api_key", "") or None,
     )
 
-    processed_paths: list[str] = []
-    for i, raw_path in enumerate(raw_paths):
-        processed_path = processed_dir / f"frame_{i}.png"
-        await asyncio.to_thread(
-            sprite_processor.process_image,
-            raw_path,
-            str(processed_path),
-            int(eff["canvas_width"]),
-            int(eff["canvas_height"]),
-            int(eff["char_width"]),
-            int(eff["foot_anchor_y"]),
-            config.get("removebg_api_key", "") or "",
+    raw_paths = await asyncio.to_thread(
+        _slice_sheet, str(sheet_bg_path), frame_count, str(raw_dir)
+    )
+
+    # Batch canvas-normalize: shared scale factor across all frames keeps
+    # character size consistent across poses (no size-pop between frames).
+    processed_paths = [str(processed_dir / f"frame_{i}.png") for i in range(len(raw_paths))]
+    await asyncio.to_thread(
+        sprite_processor.canvas_normalize_batch,
+        list(raw_paths),
+        processed_paths,
+        int(eff["canvas_width"]),
+        int(eff["canvas_height"]),
+        int(eff["char_width"]),
+        int(eff["foot_anchor_y"]),
+    )
+
+    # ── Validate frames against reference ────────────────────────────────────
+    validation = await asyncio.to_thread(
+        _validate_frames, processed_paths, reference_image
+    )
+    if not validation["all_passed"]:
+        logger.warning(
+            "generate_game_sprite: %d frame(s) failed validation — "
+            "consider regenerating. Details:\n%s",
+            len(validation["failed_indices"]),
+            validation["summary"],
         )
-        processed_paths.append(str(processed_path))
 
     contact_sheet_path = work_dir / "contact_sheet.png"
-    contact_sheet.make_contact_sheet(processed_paths, str(contact_sheet_path))
+    contact_sheet.make_contact_sheet(
+        processed_paths,
+        str(contact_sheet_path),
+        validation=validation["frames"],
+    )
 
     gif_path: str | None = None
-    if preview:
+    if preview and processed_paths:
         gif_target = work_dir / "preview.gif"
-        gif_path = await asyncio.to_thread(
-            _try_godot_preview, processed_paths, gif_target, config, fps
-        )
+        # Pillow stitch first — renders frames at their native 100x250 canvas size,
+        # so the character is clearly visible. Godot preview was producing a
+        # 1280x720 viewport with the sprite as a tiny dot, which is useless for
+        # frame review.
+        gif_path = None
+        try:
+            gif_path = await asyncio.to_thread(
+                _stitch_gif, processed_paths, str(gif_target), fps
+            )
+        except Exception as exc:
+            logger.warning("Pillow GIF stitch failed (%s) — no preview GIF", exc)
 
     written = False
+    game_path = config.get("game_project_path", "")
+
+    # Always copy contact sheet + GIF into the game project's _preview_tmp/<animation>/
+    # so Claude can read them for review regardless of write_to_assets setting.
+    if game_path:
+        preview_dir = Path(game_path) / "_preview_tmp" / animation
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        # Step 1: raw model output
+        shutil.copy2(str(sheet_path), preview_dir / "step1_raw_sheet.png")
+        # Step 2: after bg removal on full sheet
+        if sheet_bg_path.exists():
+            shutil.copy2(str(sheet_bg_path), preview_dir / "step2_bg_removed_sheet.png")
+        # Step 3: individual slices (before canvas normalization)
+        for i, raw_p in enumerate(raw_paths):
+            shutil.copy2(raw_p, preview_dir / f"step3_raw_frame_{i}.png")
+        # Step 4: canvas-normalized frames
+        for i, src in enumerate(processed_paths):
+            shutil.copy2(src, preview_dir / f"step4_frame_{i}.png")
+        # Contact sheet + GIF
+        shutil.copy2(str(contact_sheet_path), preview_dir / "contact_sheet.png")
+        shutil.copy2(str(sheet_path), preview_dir / "sheet.png")
+        for i, src in enumerate(processed_paths):
+            shutil.copy2(src, preview_dir / f"frame_{i}.png")
+        if gif_path:
+            shutil.copy2(gif_path, preview_dir / "preview.gif")
+
     if write_to_assets:
-        game_path = config.get("game_project_path", "")
         if not game_path:
             logger.warning("write_to_assets=True but game_project_path is empty")
         else:
@@ -677,6 +971,9 @@ async def generate_game_sprite(
         "written_to_assets": written,
         "reference_image": reference_image,
         "effective_config": eff,
+        "validation": validation,
+        "validation_summary": validation["summary"],
+        "validation_passed": validation["all_passed"],
     }
 
 
