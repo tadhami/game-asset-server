@@ -31,15 +31,15 @@ OUTPUT_DIR = Path(os.environ.get("GAME_ASSETS_DIR", "~/game-assets")).expanduser
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 SYSTEM_PROMPT = """\
-You are a 2D game sprite generator.
+You are a 2D game sprite reproducer — your job is pixel-accurate character copying, NOT creative design.
 
 When a reference image is provided:
-- Reproduce the character in the reference image exactly as shown. The reference image is the sole source of truth for character design, style, colors, proportions, and details.
-- Do NOT describe or interpret the character in text — let the image speak for itself.
-- Apply ONLY the changes explicitly stated in the user prompt. Change nothing else.
+- Your ONLY task is to reproduce the EXACT character shown in the reference image. Every detail must match: face shape, eye shape, eye color, hair type and length, clothing, colors, proportions, outline weight, and art style.
+- Do NOT redesign, simplify, or "improve" any part of the character. If the reference shows button eyes (large round circles), reproduce them as large round circles — NOT as glasses, goggles, or spectacles.
+- Do NOT add elements that are not in the reference (no glasses, no extra accessories, no different hairstyle).
+- Apply ONLY the pose/action changes explicitly stated in the user prompt. Change NOTHING else about the character's appearance.
 - Do NOT produce character turnaround sheets, multi-view layouts, or model sheets unless explicitly asked.
 - Do NOT add text, labels, annotations, borders, or reference grids.
-- One character, one pose, one view — unless the prompt says otherwise.
 
 When no reference image is provided:
 - Follow the user prompt exactly to generate the requested asset.
@@ -422,31 +422,49 @@ async def _generate_one_image(
     return await _extract_image_bytes(response.json(), client)
 
 
-def _build_sheet_prompt(animation: str, frame_count: int, frame_size: int) -> str:
+def _build_sheet_prompt(
+    animation: str,
+    frame_count: int,
+    frame_size: int,
+    character_description: str | None = None,
+) -> str:
     """Build a sprite-sheet generation prompt.
 
     `animation` is the caller-supplied animation-specific frame breakdown
     (e.g., per-frame pose descriptions for a run cycle). It is embedded
     verbatim in the middle of the prompt.
+
+    `character_description` is an optional explicit list of key character
+    features for the model to preserve exactly — useful for overriding model
+    misinterpretations of art-style elements (e.g. "button eyes, NOT glasses").
     """
     sheet_width = frame_size * frame_count
     sheet_height = frame_size
+
+    char_desc_section = ""
+    if character_description:
+        char_desc_section = (
+            f"\nCRITICAL — preserve these character features EXACTLY as described "
+            f"(do not reinterpret them):\n{character_description}\n"
+        )
+
     return (
         f"Using the provided reference image as the base character, generate a sprite "
         f"sheet of exactly {frame_count} frames arranged horizontally left-to-right on "
         f"a single canvas of {sheet_width}x{sheet_height} pixels (each frame is exactly "
         f"{frame_size}x{frame_size} pixels, evenly spaced with no gaps, no borders, no "
         f"labels).\n\n"
-        f"Reproduce the character from the reference image exactly as-is. Do not alter "
-        f"any aspect of the character's design, colors, outline, shading, proportions, "
-        f"or style. The reference image is the ground truth — treat it as a "
-        f"pixel-perfect template.\n\n"
+        f"This is a reproduction task, NOT a design task. Copy the character from the "
+        f"reference image pixel-perfectly — same face, same eyes, same hair, same "
+        f"clothing, same colors, same proportions, same outline weight, same art style. "
+        f"Do NOT redesign, simplify, or add anything that is not in the reference.\n"
+        f"{char_desc_section}\n"
         f"{animation}\n\n"
-        f"Critical consistency rules: The head, face, colors, outline weight, and "
-        f"shading must be identical across all {frame_count} frames. Only the pose "
-        f"elements described per-frame above may differ.\n\n"
-        f"Output only the sprite sheet image. Transparent background. No frame numbers. "
-        f"No labels. No borders between frames."
+        f"Consistency rule: The character's appearance (head, face, eyes, hair, "
+        f"clothing, colors, outline) must be identical across all {frame_count} frames. "
+        f"Only the pose changes described per-frame above may differ.\n\n"
+        f"Output: the sprite sheet image only. Transparent background. No frame "
+        f"numbers. No labels. No borders between frames."
     )
 
 
@@ -559,6 +577,7 @@ async def generate_game_sprite(
     preview: bool = True,
     write_to_assets: bool = False,
     reference_image: str | None = None,
+    character_description: str | None = None,
     canvas_width: int | None = None,
     canvas_height: int | None = None,
     char_width: int | None = None,
@@ -579,10 +598,20 @@ async def generate_game_sprite(
     If `reference_image` is None, defaults to
     `{game_project_path}/assets/characters/{character}/idle/frame_0.png`.
 
-    If `preview=True`, optionally runs Godot to render a GIF preview using
-    `tests/integration/sprite_preview.tscn` in the game project. Skips GIF
-    generation gracefully (with a warning) if Godot or the scene is
-    unavailable.
+    `character_description` is an optional plain-text description of the
+    character's key visual features that the model must preserve exactly (e.g.
+    "button eyes — large round circles, NOT glasses"). When provided it is
+    injected into the generation prompt as a CRITICAL preservation list,
+    helping the model avoid misinterpreting art-style elements in the reference
+    image. Claude should always populate this when calling the tool for a
+    known character.
+
+    If `preview=True`, generates an animated GIF from the processed frames.
+    First attempts a Godot-rendered preview via
+    `tests/integration/sprite_preview.tscn`; if Godot is unavailable or
+    fails, falls back to a Pillow-stitched GIF directly from the processed
+    frames. The GIF is always produced when `preview=True` and at least one
+    frame was processed successfully.
 
     If `write_to_assets=True`, copies the processed frames to
     `{game_project_path}/assets/characters/{character}/{animation}/frame_N.png`.
@@ -618,7 +647,7 @@ async def generate_game_sprite(
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size)
+    sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size, character_description)
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         sheet_bytes = await _generate_one_image(
@@ -651,11 +680,22 @@ async def generate_game_sprite(
     contact_sheet.make_contact_sheet(processed_paths, str(contact_sheet_path))
 
     gif_path: str | None = None
-    if preview:
+    if preview and processed_paths:
         gif_target = work_dir / "preview.gif"
+        # Try Godot-rendered preview first (higher quality, matches in-engine look).
         gif_path = await asyncio.to_thread(
             _try_godot_preview, processed_paths, gif_target, config, fps
         )
+        # Pillow fallback — always produces a GIF even when Godot is unavailable
+        # (no display, project not imported, etc.).
+        if gif_path is None:
+            logger.info("Godot preview unavailable — using Pillow GIF stitch fallback")
+            try:
+                gif_path = await asyncio.to_thread(
+                    _stitch_gif, processed_paths, str(gif_target), fps
+                )
+            except Exception as exc:
+                logger.warning("Pillow GIF stitch failed (%s) — no preview GIF", exc)
 
     written = False
     if write_to_assets:
