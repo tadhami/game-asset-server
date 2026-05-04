@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import numpy as np
 from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
@@ -322,6 +323,134 @@ async def _fetch_or_decode(url: str, client: httpx.AsyncClient) -> bytes:
     resp = await client.get(url)
     resp.raise_for_status()
     return resp.content
+
+
+# ── Frame validation ─────────────────────────────────────────────────────────
+
+def _get_char_metrics(image_path: str) -> dict | None:
+    """Return character bounding-box metrics for a processed frame.
+
+    Returns None if the frame contains no visible character pixels.
+    All measurements are in canvas pixels (before any in-engine scaling).
+    """
+    img = Image.open(image_path).convert("RGBA")
+    alpha = np.array(img)[:, :, 3]
+    rows = np.any(alpha > 20, axis=1)
+    cols = np.any(alpha > 20, axis=0)
+    if not rows.any():
+        return None
+    top    = int(np.argmax(rows))
+    bottom = int(len(rows) - np.argmax(rows[::-1]) - 1)
+    left   = int(np.argmax(cols))
+    right  = int(len(cols) - np.argmax(cols[::-1]) - 1)
+    h, w = alpha.shape
+    return {
+        "top": top, "bottom": bottom, "left": left, "right": right,
+        "height": bottom - top,
+        "width":  right - left,
+        "canvas_h": h, "canvas_w": w,
+        "head_frac": top / h,       # head position as fraction of canvas height
+        "foot_frac": bottom / h,    # foot position as fraction of canvas height
+    }
+
+
+def _validate_one_frame(
+    frame_path: str,
+    ref: dict,
+    size_tol: float = 0.18,
+    head_tol: float = 0.08,
+) -> dict:
+    """Validate a single processed frame against reference metrics.
+
+    Checks:
+    - Character height within ±size_tol of reference height
+    - Character width within ±size_tol*1.5 of reference (poses vary more laterally)
+    - Head vertical position within ±head_tol of reference (detects shrunken / floated chars)
+
+    Returns a dict with ``passed`` bool, ``issues`` list, and raw measurements.
+    """
+    m = _get_char_metrics(frame_path)
+    if m is None:
+        return {"passed": False, "issues": ["no character detected"], "metrics": None}
+
+    issues: list[str] = []
+
+    h_ratio = m["height"] / max(ref["height"], 1)
+    if abs(h_ratio - 1.0) > size_tol:
+        issues.append(
+            f"height {m['height']}px vs ref {ref['height']}px "
+            f"({h_ratio:.0%} — expected {100*(1-size_tol):.0f}–{100*(1+size_tol):.0f}%)"
+        )
+
+    w_ratio = m["width"] / max(ref["width"], 1)
+    if abs(w_ratio - 1.0) > size_tol * 1.5:
+        issues.append(
+            f"width {m['width']}px vs ref {ref['width']}px ({w_ratio:.0%})"
+        )
+
+    head_diff = abs(m["head_frac"] - ref["head_frac"])
+    if head_diff > head_tol:
+        issues.append(
+            f"head at {m['head_frac']:.0%} from top vs ref {ref['head_frac']:.0%} "
+            f"(diff {head_diff:.0%})"
+        )
+
+    return {
+        "passed": len(issues) == 0,
+        "issues": issues,
+        "metrics": m,
+        "height_ratio": h_ratio,
+        "width_ratio": w_ratio,
+    }
+
+
+def _validate_frames(
+    processed_paths: list[str],
+    reference_image_path: str,
+    size_tol: float = 0.18,
+    head_tol: float = 0.08,
+) -> dict:
+    """Validate all generated frames against the reference image.
+
+    Returns a dict with per-frame results and a human-readable summary.
+    This is always called after sprite_processor runs so that every batch
+    of generated art is checked for size and position consistency before
+    being shown or written to assets.
+    """
+    ref = _get_char_metrics(reference_image_path)
+    if ref is None:
+        logger.warning("validate_frames: could not extract metrics from reference %s", reference_image_path)
+        return {
+            "reference_ok": False,
+            "frames": [{"passed": True, "issues": ["reference unreadable"]} for _ in processed_paths],
+            "all_passed": True,
+            "failed_indices": [],
+            "summary": "validation skipped — reference unreadable",
+        }
+
+    frame_results = [
+        _validate_one_frame(p, ref, size_tol, head_tol)
+        for p in processed_paths
+    ]
+    failed = [i for i, r in enumerate(frame_results) if not r["passed"]]
+    n = len(processed_paths)
+    summary_lines = [f"{n - len(failed)}/{n} frames passed validation"]
+    for i in failed:
+        for issue in frame_results[i]["issues"]:
+            summary_lines.append(f"  frame_{i}: {issue}")
+
+    logger.info("Frame validation: %s", summary_lines[0])
+    for line in summary_lines[1:]:
+        logger.warning("Frame validation%s", line)
+
+    return {
+        "reference_ok": True,
+        "reference_metrics": ref,
+        "frames": frame_results,
+        "all_passed": len(failed) == 0,
+        "failed_indices": failed,
+        "summary": "\n".join(summary_lines),
+    }
 
 
 _DEFAULT_CONFIG = {
@@ -690,8 +819,24 @@ async def generate_game_sprite(
         )
         processed_paths.append(str(processed_path))
 
+    # ── Validate frames against reference ────────────────────────────────────
+    validation = await asyncio.to_thread(
+        _validate_frames, processed_paths, reference_image
+    )
+    if not validation["all_passed"]:
+        logger.warning(
+            "generate_game_sprite: %d frame(s) failed validation — "
+            "consider regenerating. Details:\n%s",
+            len(validation["failed_indices"]),
+            validation["summary"],
+        )
+
     contact_sheet_path = work_dir / "contact_sheet.png"
-    contact_sheet.make_contact_sheet(processed_paths, str(contact_sheet_path))
+    contact_sheet.make_contact_sheet(
+        processed_paths,
+        str(contact_sheet_path),
+        validation=validation["frames"],
+    )
 
     gif_path: str | None = None
     if preview and processed_paths:
@@ -731,6 +876,9 @@ async def generate_game_sprite(
         "written_to_assets": written,
         "reference_image": reference_image,
         "effective_config": eff,
+        "validation": validation,
+        "validation_summary": validation["summary"],
+        "validation_passed": validation["all_passed"],
     }
 
 
