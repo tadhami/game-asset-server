@@ -332,18 +332,17 @@ def _get_char_metrics(image_path: str) -> dict | None:
 
     Returns None if the frame contains no visible character pixels.
     All measurements are in canvas pixels (before any in-engine scaling).
+    Uses pure Pillow — no numpy required.
     """
     img = Image.open(image_path).convert("RGBA")
-    alpha = np.array(img)[:, :, 3]
-    rows = np.any(alpha > 20, axis=1)
-    cols = np.any(alpha > 20, axis=0)
-    if not rows.any():
+    alpha = img.split()[-1]
+    # Threshold: only count pixels with alpha > 20
+    alpha_thresh = alpha.point(lambda v: 255 if v > 20 else 0)
+    bbox = alpha_thresh.getbbox()
+    if bbox is None:
         return None
-    top    = int(np.argmax(rows))
-    bottom = int(len(rows) - np.argmax(rows[::-1]) - 1)
-    left   = int(np.argmax(cols))
-    right  = int(len(cols) - np.argmax(cols[::-1]) - 1)
-    h, w = alpha.shape
+    left, top, right, bottom = bbox
+    w, h = img.size
     return {
         "top": top, "bottom": bottom, "left": left, "right": right,
         "height": bottom - top,
@@ -475,6 +474,7 @@ def _load_config() -> dict:
     if env_path:
         candidates.append(Path(env_path).expanduser())
     candidates.append(Path.cwd() / "config.json")
+    candidates.append(Path(__file__).parent / "config.json")
 
     for path in candidates:
         if path.is_file():
@@ -598,16 +598,71 @@ def _build_sheet_prompt(
 
 
 def _slice_sheet(sheet_path: str, frame_count: int, output_dir: str) -> list[str]:
-    """Slice a horizontal sprite sheet into `frame_count` equal-width frames.
+    """Slice a horizontal sprite sheet into `frame_count` frames.
 
-    Each frame's width is `sheet_width // frame_count`. Frames are saved as
-    `raw_frame_N.png` in `output_dir` and the list of paths is returned.
+    Uses content-aware slicing: finds vertical "gap" columns (columns where
+    pixel content is sparse) to locate character boundaries, then selects the
+    `frame_count` best-spaced cut points. Falls back to equal-width slicing if
+    gap detection fails or finds too few gaps.
+
+    Frames are saved as `raw_frame_N.png` in `output_dir`.
     """
-    img = Image.open(sheet_path)
-    frame_w = img.width // frame_count
+    img = Image.open(sheet_path).convert("RGBA")
+    alpha = np.array(img)[:, :, 3]  # shape: (height, width)
+
+    # Column content score: fraction of pixels with meaningful alpha
+    col_fill = (alpha > 20).sum(axis=0) / alpha.shape[0]
+
+    # Smooth slightly to avoid noise
+    kernel_size = max(3, img.width // 200)
+    kernel = np.ones(kernel_size) / kernel_size
+    col_smooth = np.convolve(col_fill, kernel, mode="same")
+
+    # Find gap columns: below a threshold, not near the image edges
+    gap_threshold = col_smooth.max() * 0.08
+    is_gap = col_smooth < gap_threshold
+
+    # Find contiguous gap regions and pick their centers
+    gap_centers: list[int] = []
+    in_gap = False
+    gap_start = 0
+    margin = img.width // (frame_count * 4)  # ignore near-edge columns
+    for x in range(margin, img.width - margin):
+        if is_gap[x] and not in_gap:
+            in_gap = True
+            gap_start = x
+        elif not is_gap[x] and in_gap:
+            in_gap = False
+            gap_centers.append((gap_start + x) // 2)
+
+    # We need exactly (frame_count - 1) cut points between frames
+    cut_points: list[int] = []
+    if len(gap_centers) >= frame_count - 1:
+        # If more gaps than needed, pick the frame_count-1 most evenly spaced ones
+        # Strategy: greedily pick gaps that divide the sheet most evenly
+        ideal_spacing = img.width / frame_count
+        ideal_cuts = [int(ideal_spacing * (i + 1)) for i in range(frame_count - 1)]
+        for ideal in ideal_cuts:
+            closest = min(gap_centers, key=lambda g: abs(g - ideal))
+            cut_points.append(closest)
+        cut_points = sorted(set(cut_points))
+
+    # Fall back to equal-width if we couldn't find enough gaps
+    if len(cut_points) < frame_count - 1:
+        logger.info(
+            "_slice_sheet: content-aware detection found %d gaps (need %d), "
+            "falling back to equal-width slicing",
+            len(gap_centers),
+            frame_count - 1,
+        )
+        frame_w = img.width // frame_count
+        cut_points = [frame_w * (i + 1) for i in range(frame_count - 1)]
+
+    boundaries = [0] + cut_points + [img.width]
     paths: list[str] = []
     for i in range(frame_count):
-        frame = img.crop((i * frame_w, 0, (i + 1) * frame_w, img.height))
+        x0, x1 = boundaries[i], boundaries[i + 1]
+        frame = img.crop((x0, 0, x1, img.height))
         out = os.path.join(output_dir, f"raw_frame_{i}.png")
         frame.save(out)
         paths.append(out)
@@ -790,7 +845,16 @@ async def generate_game_sprite(
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size, character_description)
+    # If the caller has already supplied a complete sprite-sheet prompt (detected
+    # by the canonical "Using the provided reference image as frame 1" opener),
+    # pass it through directly rather than wrapping it with _build_sheet_prompt.
+    # Wrapping a complete template creates conflicting double-instructions that
+    # confuse the model.  We still inject character_description if provided.
+    _TEMPLATE_MARKER = "Using the provided reference image as frame 1"
+    if prompt.strip().startswith(_TEMPLATE_MARKER):
+        sheet_prompt = prompt
+    else:
+        sheet_prompt = _build_sheet_prompt(prompt, frame_count, frame_size)
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         sheet_bytes = await _generate_one_image(
@@ -800,24 +864,33 @@ async def generate_game_sprite(
     sheet_path = work_dir / "sheet.png"
     sheet_path.write_bytes(sheet_bytes)
 
-    raw_paths = await asyncio.to_thread(
-        _slice_sheet, str(sheet_path), frame_count, str(raw_dir)
+    # Remove background from the full sheet in one API call, then slice.
+    # This gives far cleaner results than per-frame removal — remove.bg sees
+    # the whole composition and won't clip edges or eat light-coloured pixels.
+    sheet_bg_path = work_dir / "sheet_bg_removed.png"
+    await asyncio.to_thread(
+        sprite_processor.strip_background,
+        str(sheet_path),
+        str(sheet_bg_path),
+        config.get("removebg_api_key", "") or None,
     )
 
-    processed_paths: list[str] = []
-    for i, raw_path in enumerate(raw_paths):
-        processed_path = processed_dir / f"frame_{i}.png"
-        await asyncio.to_thread(
-            sprite_processor.process_image,
-            raw_path,
-            str(processed_path),
-            int(eff["canvas_width"]),
-            int(eff["canvas_height"]),
-            int(eff["char_width"]),
-            int(eff["foot_anchor_y"]),
-            config.get("removebg_api_key", "") or "",
-        )
-        processed_paths.append(str(processed_path))
+    raw_paths = await asyncio.to_thread(
+        _slice_sheet, str(sheet_bg_path), frame_count, str(raw_dir)
+    )
+
+    # Batch canvas-normalize: shared scale factor across all frames keeps
+    # character size consistent across poses (no size-pop between frames).
+    processed_paths = [str(processed_dir / f"frame_{i}.png") for i in range(len(raw_paths))]
+    await asyncio.to_thread(
+        sprite_processor.canvas_normalize_batch,
+        list(raw_paths),
+        processed_paths,
+        int(eff["canvas_width"]),
+        int(eff["canvas_height"]),
+        int(eff["char_width"]),
+        int(eff["foot_anchor_y"]),
+    )
 
     # ── Validate frames against reference ────────────────────────────────────
     validation = await asyncio.to_thread(
@@ -841,24 +914,46 @@ async def generate_game_sprite(
     gif_path: str | None = None
     if preview and processed_paths:
         gif_target = work_dir / "preview.gif"
-        # Try Godot-rendered preview first (higher quality, matches in-engine look).
-        gif_path = await asyncio.to_thread(
-            _try_godot_preview, processed_paths, gif_target, config, fps
-        )
-        # Pillow fallback — always produces a GIF even when Godot is unavailable
-        # (no display, project not imported, etc.).
-        if gif_path is None:
-            logger.info("Godot preview unavailable — using Pillow GIF stitch fallback")
-            try:
-                gif_path = await asyncio.to_thread(
-                    _stitch_gif, processed_paths, str(gif_target), fps
-                )
-            except Exception as exc:
-                logger.warning("Pillow GIF stitch failed (%s) — no preview GIF", exc)
+        # Pillow stitch first — renders frames at their native 100x250 canvas size,
+        # so the character is clearly visible. Godot preview was producing a
+        # 1280x720 viewport with the sprite as a tiny dot, which is useless for
+        # frame review.
+        gif_path = None
+        try:
+            gif_path = await asyncio.to_thread(
+                _stitch_gif, processed_paths, str(gif_target), fps
+            )
+        except Exception as exc:
+            logger.warning("Pillow GIF stitch failed (%s) — no preview GIF", exc)
 
     written = False
+    game_path = config.get("game_project_path", "")
+
+    # Always copy contact sheet + GIF into the game project's _preview_tmp/<animation>/
+    # so Claude can read them for review regardless of write_to_assets setting.
+    if game_path:
+        preview_dir = Path(game_path) / "_preview_tmp" / animation
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        # Step 1: raw model output
+        shutil.copy2(str(sheet_path), preview_dir / "step1_raw_sheet.png")
+        # Step 2: after bg removal on full sheet
+        if sheet_bg_path.exists():
+            shutil.copy2(str(sheet_bg_path), preview_dir / "step2_bg_removed_sheet.png")
+        # Step 3: individual slices (before canvas normalization)
+        for i, raw_p in enumerate(raw_paths):
+            shutil.copy2(raw_p, preview_dir / f"step3_raw_frame_{i}.png")
+        # Step 4: canvas-normalized frames
+        for i, src in enumerate(processed_paths):
+            shutil.copy2(src, preview_dir / f"step4_frame_{i}.png")
+        # Contact sheet + GIF
+        shutil.copy2(str(contact_sheet_path), preview_dir / "contact_sheet.png")
+        shutil.copy2(str(sheet_path), preview_dir / "sheet.png")
+        for i, src in enumerate(processed_paths):
+            shutil.copy2(src, preview_dir / f"frame_{i}.png")
+        if gif_path:
+            shutil.copy2(gif_path, preview_dir / "preview.gif")
+
     if write_to_assets:
-        game_path = config.get("game_project_path", "")
         if not game_path:
             logger.warning("write_to_assets=True but game_project_path is empty")
         else:
